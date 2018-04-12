@@ -1,328 +1,480 @@
-'''
-Qrcode example application
-==========================
-Author: Mathieu Virbel <mat@meltingrocks.com>
-Featuring:
-- Android camera initialization
-- Show the android camera into a Android surface that act as an overlay
-- New AndroidWidgetHolder that control any android view as an overlay
-- New ZbarQrcodeDetector that use AndroidCamera / PreviewFrame + zbar to
-  detect Qrcode.
-'''
+import kivy
+import urllib.request
+import requests
 
-
-__version__ = '1.0'
-
-from collections import namedtuple
-from kivy.lang import Builder
 from kivy.app import App
-from kivy.properties import ObjectProperty, ListProperty, BooleanProperty, \
-    NumericProperty
-from kivy.uix.widget import Widget
-from kivy.uix.anchorlayout import AnchorLayout
-from kivy.graphics import Color, Line
-from jnius import autoclass, PythonJavaClass, java_method, cast
-from android.runnable import run_on_ui_thread
+from kivy.uix.boxlayout import BoxLayout
+from kivy.properties import ObjectProperty
+from kivy.uix.popup import Popup
+from kivy.uix.textinput import TextInput
+from kivy.uix.label import Label
 
-# preload java classes
-System = autoclass('java.lang.System')
-System.loadLibrary('iconv')
-PythonActivity = autoclass('org.renpy.android.PythonActivity')
-Camera = autoclass('android.hardware.Camera')
-ImageScanner = autoclass('net.sourceforge.zbar.ImageScanner')
-Config = autoclass('net.sourceforge.zbar.Config')
-SurfaceView = autoclass('android.view.SurfaceView')
-LayoutParams = autoclass('android.view.ViewGroup$LayoutParams')
-Image = autoclass('net.sourceforge.zbar.Image')
-ImageFormat = autoclass('android.graphics.ImageFormat')
-LinearLayout = autoclass('android.widget.LinearLayout')
-Symbol = autoclass('net.sourceforge.zbar.Symbol')
+from kivy.app import App
+from kivy.lang import Builder
+from kivy.uix.screenmanager import ScreenManager, Screen
 
+import DBcm
 
-class PreviewCallback(PythonJavaClass):
-    '''Interface used to get back the preview frame of the Android Camera
-    '''
-    __javainterfaces__ = ('android.hardware.Camera$PreviewCallback', )
+getItemsURL = 'https://www.pythonanywhere.com/getItemsCheck'
+config = {
+    'host': '127.0.0.1',
+    'database':'finalproject',
+    'user':'root',
+    'password':'root',
+    }
 
-    def __init__(self, callback):
-        super(PreviewCallback, self).__init__()
-        self.callback = callback
-
-    @java_method('([BLandroid/hardware/Camera;)V')
-    def onPreviewFrame(self, data, camera):
-        self.callback(camera, data)
-
-
-class SurfaceHolderCallback(PythonJavaClass):
-    '''Interface used to know exactly when the Surface used for the Android
-    Camera will be created and changed.
-    '''
-
-    __javainterfaces__ = ('android.view.SurfaceHolder$Callback', )
-
-    def __init__(self, callback):
-        super(SurfaceHolderCallback, self).__init__()
-        self.callback = callback
- 
-    @java_method('(Landroid/view/SurfaceHolder;III)V')
-    def surfaceChanged(self, surface, fmt, width, height):
-        self.callback(fmt, width, height)
-
-    @java_method('(Landroid/view/SurfaceHolder;)V')
-    def surfaceCreated(self, surface):
-        pass
- 
-    @java_method('(Landroid/view/SurfaceHolder;)V')
-    def surfaceDestroyed(self, surface):
-        pass
-
-
-class AndroidWidgetHolder(Widget):
-    '''Act as a placeholder for an Android widget.
-    It will automatically add / remove the android view depending if the widget
-    view is set or not. The android view will act as an overlay, so any graphics
-    instruction in this area will be covered by the overlay.
-    '''
-
-    view = ObjectProperty(allownone=True)
-    '''Must be an Android View
-    '''
-
-    def __init__(self, **kwargs):
-        self._old_view = None
-        from kivy.core.window import Window
-        self._window = Window
-        kwargs['size_hint'] = (None, None)
-        super(AndroidWidgetHolder, self).__init__(**kwargs)
-
-    def on_view(self, instance, view):
-        if self._old_view is not None:
-            layout = cast(LinearLayout, self._old_view.getParent())
-            layout.removeView(self._old_view)
-            self._old_view = None
-
-        if view is None:
-            return
-
-        activity = PythonActivity.mActivity
-        activity.addContentView(view, LayoutParams(*self.size))
-        view.setZOrderOnTop(True)
-        view.setX(self.x)
-        view.setY(self._window.height - self.y - self.height)
-        self._old_view = view
-
-    def on_size(self, instance, size):
-        if self.view:
-            params = self.view.getLayoutParams()
-            params.width = self.width
-            params.height = self.height
-            self.view.setLayoutParams(params)
-            self.view.setY(self._window.height - self.y - self.height)
-
-    def on_x(self, instance, x):
-        if self.view:
-            self.view.setX(x)
-
-    def on_y(self, instance, y):
-        if self.view:
-            self.view.setY(self._window.height - self.y - self.height)
-
-
-class AndroidCamera(Widget):
-    '''Widget for controling an Android Camera.
-    '''
-
-    index = NumericProperty(0)
-
-    __events__ = ('on_preview_frame', )
-
-    def __init__(self, **kwargs):
-        self._holder = None
-        self._android_camera = None
-        super(AndroidCamera, self).__init__(**kwargs)
-        self._holder = AndroidWidgetHolder(size=self.size, pos=self.pos)
-        self.add_widget(self._holder)
-
-    @run_on_ui_thread
-    def stop(self):
-        if self._android_camera is None:
-            return
-        self._android_camera.setPreviewCallback(None)
-        self._android_camera.release()
-        self._android_camera = None
-        self._holder.view = None
-
-    @run_on_ui_thread
-    def start(self):
-        if self._android_camera is not None:
-            return
-
-        self._android_camera = Camera.open(self.index)
-
-        # create a fake surfaceview to get the previewCallback working.
-        self._android_surface = SurfaceView(PythonActivity.mActivity)
-        surface_holder = self._android_surface.getHolder()
-
-        # create our own surface holder to correctly call the next method when
-        # the surface is ready
-        self._android_surface_cb = SurfaceHolderCallback(self._on_surface_changed)
-        surface_holder.addCallback(self._android_surface_cb)
-
-        # attach the android surfaceview to our android widget holder
-        self._holder.view = self._android_surface
-
-    def _on_surface_changed(self, fmt, width, height):
-        # internal, called when the android SurfaceView is ready
-        # FIXME if the size is not handled by the camera, it will failed.
-        params = self._android_camera.getParameters()
-        params.setPreviewSize(width, height)
-        self._android_camera.setParameters(params)
-
-        # now that we know the camera size, we'll create 2 buffers for faster
-        # result (using Callback buffer approach, as described in Camera android
-        # documentation)
-        # it also reduce the GC collection
-        bpp = ImageFormat.getBitsPerPixel(params.getPreviewFormat()) / 8.
-        buf = '\x00' * int(width * height * bpp)
-        self._android_camera.addCallbackBuffer(buf)
-        self._android_camera.addCallbackBuffer(buf)
-
-        # create a PreviewCallback to get back the onPreviewFrame into python
-        self._previewCallback = PreviewCallback(self._on_preview_frame)
-
-        # connect everything and start the preview
-        self._android_camera.setPreviewCallbackWithBuffer(self._previewCallback);
-        self._android_camera.setPreviewDisplay(self._android_surface.getHolder())
-        self._android_camera.startPreview();
-
-    def _on_preview_frame(self, camera, data):
-        # internal, called by the PreviewCallback when onPreviewFrame is
-        # received
-        self.dispatch('on_preview_frame', camera, data)
-        # reintroduce the data buffer into the queue
-        self._android_camera.addCallbackBuffer(data)
-
-    def on_preview_frame(self, camera, data):
-        pass
-
-    def on_size(self, instance, size):
-        if self._holder:
-            self._holder.size = size
-
-    def on_pos(self, instance, pos):
-        if self._holder:
-            self._holder.pos = pos
-
-
-class ZbarQrcodeDetector(AnchorLayout):
-    '''Widget that use the AndroidCamera and zbar to detect qrcode.
-    When found, the `symbols` will be updated
-    '''
-    camera_size = ListProperty([320, 240])
-
-    symbols = ListProperty([])
-
-    # XXX can't work now, due to overlay.
-    show_bounds = BooleanProperty(False)
-
-    Qrcode = namedtuple('Qrcode',
-            ['type', 'data', 'bounds', 'quality', 'count'])
-
-    def __init__(self, **kwargs):
-        super(ZbarQrcodeDetector, self).__init__(**kwargs)
-        self._camera = AndroidCamera(
-                size=self.camera_size,
-                size_hint=(None, None))
-        self._camera.bind(on_preview_frame=self._detect_qrcode_frame)
-        self.add_widget(self._camera)
-
-        # create a scanner used for detecting qrcode
-        self._scanner = ImageScanner()
-        self._scanner.setConfig(0, Config.ENABLE, 0)
-        self._scanner.setConfig(Symbol.QRCODE, Config.ENABLE, 1)
-        self._scanner.setConfig(0, Config.X_DENSITY, 3)
-        self._scanner.setConfig(0, Config.Y_DENSITY, 3)
-
-    def start(self):
-        self._camera.start()
-
-    def stop(self):
-        self._camera.stop()
-
-    def _detect_qrcode_frame(self, instance, camera, data):
-        # the image we got by default from a camera is using the NV21 format
-        # zbar only allow Y800/GREY image, so we first need to convert,
-        # then start the detection on the image
-        parameters = camera.getParameters()
-        size = parameters.getPreviewSize()
-        barcode = Image(size.width, size.height, 'NV21')
-        barcode.setData(data)
-        barcode = barcode.convert('Y800')
-
-        result = self._scanner.scanImage(barcode)
-
-        if result == 0:
-            self.symbols = []
-            return
-
-        # we detected qrcode! extract and dispatch them
-        symbols = []
-        it = barcode.getSymbols().iterator()
-        while it.hasNext():
-            symbol = it.next()
-            qrcode = ZbarQrcodeDetector.Qrcode(
-                type=symbol.getType(),
-                data=symbol.getData(),
-                quality=symbol.getQuality(),
-                count=symbol.getCount(),
-                bounds=symbol.getBounds())
-            symbols.append(qrcode)
-
-        self.symbols = symbols
-
-    '''
-    # can't work, due to the overlay.
-    def on_symbols(self, instance, value):
-        if self.show_bounds:
-            self.update_bounds()
-    def update_bounds(self):
-        self.canvas.after.remove_group('bounds')
-        if not self.symbols:
-            return
-        with self.canvas.after:
-            Color(1, 0, 0, group='bounds')
-            for symbol in self.symbols:
-                x, y, w, h = symbol.bounds
-                x = self._camera.right - x - w
-                y = self._camera.top - y - h
-                Line(rectangle=[x, y, w, h], group='bounds')
-    '''
-
-
-if __name__ == '__main__':
-
-    qrcode_kv = '''
-BoxLayout:
-    orientation: 'vertical'
-    ZbarQrcodeDetector:
-        id: detector
-    Label:
-        text: '\\n'.join(map(repr, detector.symbols))
-        size_hint_y: None
-        height: '100dp'
+Builder.load_string("""
+<MenuScreen>:
     BoxLayout:
-        size_hint_y: None
-        height: '48dp'
+        orientation: "vertical"
         Button:
-            text: 'Scan a qrcode'
-            on_release: detector.start()
+            text: "Create New"
+            on_press:
+                root.manager.transition.direction = 'left'
+                root.manager.transition.duration  = 1
+                root.manager.current = 'create_new'
         Button:
-            text: 'Stop detection'
-            on_release: detector.stop()
-'''
+            text: "Check Current"
+            on_press:
+                root.manager.transition.direction = 'left'
+                root.manager.transition.duration = 1
+                root.manager.current = 'check_current'
+        Button:
+            text: "Finish + Select Store"
+            on_press:
+                root.manager.transition.direction = 'left'
+                root.manager.transition.duration = 1
+                root.manager.current = 'finish'
+<CreateNewScreen>:
+    BoxLayout:
+        orientation:"vertical"
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .1
+            text: "Bakery"
+            values: ["bread", "buns", "cake", "muffins", "pastries"]
+            id: bakery_id
+            on_text: root.bakery_spinner_clicked(bakery_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .1
+            text: "Fruit"
+            values: ["apples", "bananas", "grapes", "lemons", "melons"]
+            id: fruit_id
+            on_text: root.fruit_spinner_clicked(fruit_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .1
+            text: "Vegetables"
+            values: ["artichokes", "broccoli", "carrots", "peas", "sweet potato"]
+            id: veg_id
+            on_text: root.veg_spinner_clicked(veg_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .1
+            text: "Dairy"
+            values: ["butter", "cheese", "eggs", "milk", "yogurts"]
+            id: dairy_id
+            on_text: root.dairy_spinner_clicked(dairy_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .1
+            text: "Frozen"
+            values: ["chicken burgers", "chips", "frozen veg", "icecreaam", "pizza"]
+            id: frozen_id
+            on_text: root.frozen_spinner_clicked(frozen_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .1
+            text: "Snacks"
+            values: ["biscuits", "chocolate", "crisps", "cordial", "minerals"]
+            id: snacks_id
+            on_text: root.snacks_spinner_clicked(snacks_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .1
+            text: "Hot beverages"
+            values: ["coffee beans", "hot chocolate", "herbal tea", "instant coffee", "tea bags"]
+            id: hotBev_id
+            on_text: root.hotBev_spinner_clicked(hotBev_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .1
+            text: "baking essentials"
+            values: ["castor sugar", "icing sugar", "mixed peel", "plain flour", "self-raising flour"]
+            id: bakEss_id
+            on_text: root.bakEss_spinner_clicked(bakEss_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .1
+            text: "condiments"
+            values: ["brown sauce","gravy","pepper","tomato sauce","vinegar"]
+            id: con_id
+            on_text: root.con_spinner_clicked(con_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .1
+            text: "sauce jars"
+            values: ["curry","lasanga","pasta bake","spaghetti bolognese","sweet and sour"]
+            id: sauce_id
+            on_text: root.sauce_spinner_clicked(sauce_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .1
+            text: "Grains"
+            values: ["brown rice", "easy cook rice", "lasanga sheets", "noodles", "pasta" ]
+            id: grain_id
+            on_text: root.grain_spinner_clicked(grain_id.text)
+        BoxLayout:
+            orientation: "vertical"
+            size_hint_x: 1
+            Button:
+                size_hint_x: 1
+                size_hint_y: .2
+                text: "Start List"
+                on_press: root.start()
+            Button:
+                size_hint_x: 1
+                size_hint_y: None
+                text: "Submit"
+                on_press: root.submit_items()
+            Button:
+                size_hint_x: 1
+                size_hint_y: .2
+                text: "Main Menu"
+                on_press:
+                    root.manager.transition.direction = 'right'
+                    root.manager.transition.duration = 1
+                    root.manager.current = 'main_menu'
+            Button:
+                size_hint_x: 1
+                size_hint_y: .2
+                text: "Check Current"
+                on_press:
+                    root.manager.transition.direction = 'left'
+                    root.manager.transition.duration = 1
+                    root.manager.current = 'check_current'
+            Button:
+                size_hint_x: 1
+                size_hint_y: .2
+                text: "Select Store"
+                on_press:
+                    root.manager.transition.direction = 'left'
+                    root.manager.transition.duration = 1
+                    root.manager.current = 'finish'
+<ViewCurrentScreen>:
+    button : button
+    box : box
+    BoxLayout:
+        orientation: "vertical"
+        Label:
+            font_size: 20
+            text: "Check Current"
+            size_hint_x: 1
+        Button:
+            id: button
+            text: "display items"
+            on_release: root.get_items()
+        BoxLayout:
+            id: box
+            size_hint_y: 0.9
+            orientation: "vertical"
+        Button:
+            text: "add more items"
+            on_press:
+                root.manager.transition.direction = 'right'
+                root.manager.transition.duration = 1
+                root.manager.current = 'create_new'
+        Button:
+            text: "finish + select store"
+            on_press:
+                root.manager.transition.direction = 'left'
+                root.manager.transition.duration = 1
+                root.manager.current = 'finish'
 
-    class main(App):
-        def build(self):
-            return Builder.load_string(qrcode_kv)
+<FinishScreen>:
+    BoxLayout:
+        orientation: "vertical"
+        Label:
+            font_size: 20
+            text: "You were previously at..."
+            size_hint_x: 1
+        TextInput:
+            text: "(previous store)"
+        Label:
+            font_size: 20
+            text: "Would you like to return to this store?"
+            size_hint_x: 1
+        Button:
+            text: "Yes"
+            on_press:
+                root.manager.transition.direction = 'left'
+                root.manager.transition.duration = 1
+                root.manager.current = 'view_finish'
+        Button:
+            text: "No, select another store"
+            on_press:
+                root.manager.transition.direction = 'right'
+                root.manager.transition.duration = 1
+                root.manager.current = 'select_store'
+        Button:
+            size_hint_x: 1
+            size_hint_y: None
+            text: "Main Menu"
+            on_press:
+                root.manager.transition.direction = 'right'
+                root.manager.transition.duration = 1
+                root.manager.current = 'main_menu'
+<SelectStoreScreen>:
+    BoxLayout:
+        orientation: "vertical"
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .4
+            text: "County"
+            values: ["Carlow"]
+            id: county_id
+            on_text: root.county_clicked(county_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .4
+            text: "Town"
+            values: ["Carlow"]
+            id: town_id
+            on_text: root.get_towns()
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .4
+            text: "Store"
+            values: ["Aldi", "Dunnes Stores", "Lidl", "Supervalu", "Tesco"]
+            id: store_id
+            on_text: root.store_clicked(store_id.text)
+        BoxLayout:
+            orientation: "vertical"
+            size_hint_x: 1
+            Button:
+                size_hint_x: 1
+                size_hint_y: None
+                text: "Main Menu"
+                on_press:
+                    root.manager.transition.direction = 'right'
+                    root.manager.transition.duration = 1
+                    root.manager.current = 'main_menu'
 
-main().run()
+<ViewFinishScreen>:
+    button : button
+    box : box
+    BoxLayout:
+        orientation: "vertical"
+        Label:
+            font_size: 20
+            text: "Your current list of items"
+            size_hint_x: 1
+        Button:
+            id: button
+            text: "display items"
+            on_release: root.match_items()
+        BoxLayout:
+            id: box
+            size_hint_y: 0.9
+            orientation: "vertical"  
+        BoxLayout:
+            orientation: "vertical"
+            size_hint_x: 1
+            Button:
+                size_hint_x: 1
+                size_hint_y: None
+                text: "Report a Change"
+                on_press:
+                    root.manager.transition.direction = 'right'
+                    root.manager.transition.duration = 1
+                    root.manager.current = 'report_change'
+
+<ReportChangeScreen>:
+    BoxLayout:
+        orientation: "vertical"
+        Label:
+            font_size: 20
+            text: "Report a Change"
+            size_hint_x: 1
+            size_hint_y: .1
+        Button:
+            size_hint_x: 1
+            size_hint_y: None
+            text: "Start"
+            on_press: root.start()
+        TextInput:
+            size_hint_x: 1
+            size_hint_y: .2
+            text: "item changed"
+            id: reportChangeItem_id
+            on_text: root.item_change(reportChangeItem_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .4
+            text: "moved from aisle: "
+            values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+            id: fromLocation_id
+            on_text: root.from_location(fromLocation_id.text)
+        Spinner:
+            size_hint_x: 1
+            size_hint_y: .4
+            text: "moved to aisle: "
+            values: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+            id: toLocation_id
+            on_text: root.to_location(toLocation_id.text)
+        BoxLayout:
+            orientation: "vertical"
+            size_hint_x: 1
+            Button:
+                size_hint_x: 1
+                size_hint_y: None
+                text: "submit"
+                on_press: root.submit_items()
+            Button:
+                size_hint_x: 1
+                size_hint_y: None
+                text: "Return to list"
+                on_press:
+                    root.manager.transition.direction = 'left'
+                    root.manager.transition.duration = 1
+                    root.manager.current = 'view_finish'     
+""")
+
+class MenuScreen(Screen):
+    pass
+
+#####################################
+class CreateNewScreen(Screen):
+    def start(self):   
+        self.materials = {}
+        
+    def bakery_spinner_clicked(self, value):
+        quantity = 1
+        self.materials[value] = quantity
+       
+    def fruit_spinner_clicked(self, value):
+        quantity = 1
+        self.materials[value] = quantity
+
+    def veg_spinner_clicked(self, value):
+        quantity = 1
+        self.materials[value] = quantity
+
+    def dairy_spinner_clicked(self, value):
+        quantity = 1
+        self.materials[value] = quantity
+
+    def frozen_spinner_clicked(self, value):
+        quantity = 1
+        self.materials[value] = quantity
+
+    def snacks_spinner_clicked(self, value):
+        quantity = 1
+        self.materials[value] = quantity
+        
+    def hotBev_spinner_clicked(self, value):
+        quantity = 1
+        self.materials[value] = quantity
+
+    def bakEss_spinner_clicked(self, value):
+        quantity = 1
+        self.materials[value] = quantity
+
+    def con_spinner_clicked(self, value):
+        quantity = 1
+        self.materials[value] = quantity
+
+    def sauce_spinner_clicked(self, value):
+        quantity = 1
+        self.materials[value] = quantity
+
+    def grain_spinner_clicked(self, value):
+        quantity = 1
+        self.materials[value] = quantity
+
+    def submit_items(self):
+        payload = self.materials
+        r = requests.post("http://moorej.pythonanywhere.com/receiveItems", data=payload)
+        print(r.text)
+        
+################################         
+class ViewCurrentScreen(Screen):
+    def get_items(self):
+        with urllib.request.urlopen('http://moorej.pythonanywhere.com/getItemsCheck') as response:
+            items = response.read()
+        items = str(items)
+
+        self.box.add_widget(
+            Label(text='{0}'.format(items)))
+   
+#############################################
+class FinishScreen(Screen):
+    pass
+
+##########################################
+class SelectStoreScreen(Screen):
+      def county_clicked(self, value):
+        print("County value " + value)
+
+      def town_clicked(self, value):
+        print("Town value " + value)
+
+      def store_clicked(self, value):
+        print("Store value " + value)
+
+##########################################
+class ViewFinishScreen(Screen):
+    def match_items(self):
+        with urllib.request.urlopen('http://moorej.pythonanywhere.com/matchItems') as response:
+            l = response.read()
+
+        l = str(l)
+        self.box.add_widget(
+            Label(text='{0}'.format(l)))
+           
+            
+########################################
+class ReportChangeScreen(Screen):
+    def start(self):   
+        self.report = {}
+      
+    def item_change(self, value):
+        value = str(value)
+        value = value.lower()
+        self.report['itemChanged'] = value
+        
+    def from_location(self, value):
+        value = int(value)
+        self.report['locationFrom'] = value
+        
+    def to_location(self, value):
+        value = int(value)
+        self.report['locationTo'] = value
+
+    def submit_items(self):
+        payload = self.report
+        r = requests.post("http://moorej.pythonanywhere.com/reportChange", data=payload)
+        print(r.text)
+
+##########################################################################################
+        
+screen_manager = ScreenManager()
+
+screen_manager.add_widget(MenuScreen(name="main_menu"))
+screen_manager.add_widget(CreateNewScreen(name="create_new"))
+screen_manager.add_widget(ViewCurrentScreen(name="check_current"))
+screen_manager.add_widget(FinishScreen(name="finish"))
+screen_manager.add_widget(SelectStoreScreen(name="select_store"))
+screen_manager.add_widget(ViewFinishScreen(name="view_finish"))
+screen_manager.add_widget(ReportChangeScreen(name="report_change"))
+
+class ScreenApp(App):
+    def build(self):
+
+        #set background colour for the window
+        #Window.clearcolor = (1,1,1,1)
+        return screen_manager
+
+sample_app = ScreenApp()
+sample_app.run()
